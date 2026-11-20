@@ -26,6 +26,8 @@ import re
 import subprocess
 import sys
 import zipfile
+from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -127,11 +129,9 @@ class ResultCollector:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def read_csv_auto(path: Path) -> tuple[list[str], list[list[str]], str]:
-    """Read a CSV file, auto-detecting delimiter. Returns (header, rows, delimiter).
-
-    Raises ValueError if the file is a Git LFS pointer.
-    """
+@contextmanager
+def open_csv_auto(path: Path):
+    """Yield the header, a row iterator and the detected delimiter."""
     if is_lfs_pointer(path):
         raise ValueError(
             f"{path.name} is a Git LFS pointer file (not actual data). "
@@ -140,20 +140,19 @@ def read_csv_auto(path: Path) -> tuple[list[str], list[list[str]], str]:
 
     with open(path, encoding="utf-8-sig") as f:
         sample = f.read(4096)
-
-    # Sniff delimiter
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        delimiter = dialect.delimiter
-    except csv.Error:
-        delimiter = ","
-
-    with open(path, encoding="utf-8-sig") as f:
+        try:
+            delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter
+        except csv.Error:
+            delimiter = ","
+        f.seek(0)
         reader = csv.reader(f, delimiter=delimiter)
-        header = next(reader, None)
-        rows = list(reader)
+        yield next(reader, []), reader, delimiter
 
-    return header or [], rows, delimiter
+
+def read_csv_auto(path: Path) -> tuple[list[str], list[list[str]], str]:
+    """Read a small table, such as a codebook, in full."""
+    with open_csv_auto(path) as (header, rows, delimiter):
+        return header, list(rows), delimiter
 
 
 def load_main_codebook() -> set[str]:
@@ -293,14 +292,27 @@ def validate_data_integrity(
     Returns a dict mapping csv filename to its list of column names.
     """
     csv_column_map: dict[str, list[str]] = {}
+    processed_counts: dict[Path, int] = {}
 
     for csv_path in csvs:
         try:
-            header, rows, _ = read_csv_auto(csv_path)
+            with open_csv_auto(csv_path) as (header, rows, _):
+                n_rows = n_empty = 0
+                empty_examples = []
+                missing_counts = [0] * len(header)
+                for n_rows, row in enumerate(rows, 1):
+                    if not any(cell.strip() for cell in row):
+                        n_empty += 1
+                        if len(empty_examples) < 10:
+                            empty_examples.append(n_rows + 1)  # header is line 1
+                    for i in range(len(header)):
+                        if i >= len(row) or not row[i].strip():
+                            missing_counts[i] += 1
         except Exception as e:
             rc.error(MODULE_DATA, f"Could not parse {csv_path.name}: {e}")
             continue
 
+        processed_counts[csv_path] = n_rows
         if not header:
             rc.error(MODULE_DATA, f"{csv_path.name} has no header row.")
             continue
@@ -313,17 +325,11 @@ def validate_data_integrity(
             rc.error(MODULE_DATA, f"{csv_path.name}: missing required column 'participant_id'.")
 
         # --- Empty rows ---
-        empty_rows = [
-            i + 2  # 1-indexed, +1 for header
-            for i, row in enumerate(rows)
-            if all(cell.strip() == "" for cell in row)
-        ]
-        if empty_rows:
-            display = empty_rows[:10]
-            suffix = f" (and {len(empty_rows) - 10} more)" if len(empty_rows) > 10 else ""
+        if n_empty:
+            suffix = f" (and {n_empty - 10} more)" if n_empty > 10 else ""
             rc.error(
                 MODULE_DATA,
-                f"{csv_path.name}: {len(empty_rows)} fully empty row(s) at lines {display}{suffix}.",
+                f"{csv_path.name}: {n_empty} fully empty row(s) at lines {empty_examples}{suffix}.",
             )
 
         # --- Column names vs local CODEBOOK ---
@@ -336,12 +342,8 @@ def validate_data_integrity(
                 )
 
         # --- Missing values ---
-        if rows:
-            n_rows = len(rows)
-            for col_idx, col_name in enumerate(columns):
-                n_missing = sum(
-                    1 for row in rows if col_idx >= len(row) or row[col_idx].strip() == ""
-                )
+        if n_rows:
+            for col_name, n_missing in zip(columns, missing_counts):
                 frac = n_missing / n_rows
                 if frac > MISSING_THRESHOLD:
                     rc.warning(
@@ -351,21 +353,17 @@ def validate_data_integrity(
                     )
 
     # --- Sanity check: original vs processed ---
-    _sanity_check_original_vs_processed(folder, csvs, rc)
+    _sanity_check_original_vs_processed(folder, processed_counts, rc)
 
     return csv_column_map
 
 
 def _sanity_check_original_vs_processed(
     folder: Path,
-    csvs: list[Path],
+    processed_counts: dict[Path, int],
     rc: ResultCollector,
 ):
-    """Spot-check a few rows from originals against processed data.
-
-    Only runs when original_data contains CSV files.
-    """
-    import random
+    """Compare each processed row count with the total number of original rows."""
 
     orig_dir = folder / "original_data"
     if not orig_dir.exists():
@@ -379,35 +377,31 @@ def _sanity_check_original_vs_processed(
         )
         return
 
-    # For each processed CSV, check row count plausibility against originals
-    for csv_path in csvs:
+    if not processed_counts:
+        return
+
+    total_orig_rows = 0
+    for orig_csv in orig_csvs:
         try:
-            _, proc_rows, _ = read_csv_auto(csv_path)
+            with open_csv_auto(orig_csv) as (_, rows, _):
+                total_orig_rows += sum(1 for _ in rows)
         except Exception:
             continue
 
-        # Sum original row counts
-        total_orig_rows = 0
-        for orig_csv in orig_csvs:
-            try:
-                _, orig_rows, _ = read_csv_auto(orig_csv)
-                total_orig_rows += len(orig_rows)
-            except Exception:
-                continue
-
-        if total_orig_rows > 0 and len(proc_rows) > 0:
-            ratio = len(proc_rows) / total_orig_rows
+    for csv_path, n_rows in processed_counts.items():
+        if total_orig_rows > 0 and n_rows > 0:
+            ratio = n_rows / total_orig_rows
             if ratio > 2.0:
                 rc.warning(
                     MODULE_DATA,
-                    f"{csv_path.name} has {len(proc_rows)} rows but original_data CSVs "
+                    f"{csv_path.name} has {n_rows} rows but original_data CSVs "
                     f"have {total_orig_rows} total rows (ratio {ratio:.1f}x) — "
                     "unexpected expansion, worth verifying.",
                 )
             elif ratio < 0.1:
                 rc.warning(
                     MODULE_DATA,
-                    f"{csv_path.name} has {len(proc_rows)} rows but original_data CSVs "
+                    f"{csv_path.name} has {n_rows} rows but original_data CSVs "
                     f"have {total_orig_rows} total rows (ratio {ratio:.2f}x) — "
                     "large reduction, worth verifying.",
                 )
@@ -489,36 +483,33 @@ def validate_prompts(
     for cols in csv_column_map.values():
         all_csv_columns.update(cols)
 
+    # Keep the same first/last sample while reading through the end of the ZIP member.
+    max_sample = 100
     for jsonl_name in jsonl_files:
+        first = []
+        last = deque(maxlen=max_sample // 2)
+        n_lines = line_number = 0
         try:
-            with zf.open(jsonl_name) as f:
-                stream = io.TextIOWrapper(f, encoding="utf-8")
-                lines = stream.readlines()
+            with zf.open(jsonl_name) as f, io.TextIOWrapper(f, encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, 1):
+                    line = line.strip()
+                    if line:
+                        n_lines += 1
+                        if len(first) < max_sample // 2:
+                            first.append((line_number, line))
+                        else:
+                            last.append((line_number, line))
         except Exception as e:
             rc.error(MODULE_PROMPTS, f"Could not read {jsonl_name}: {e}")
             continue
 
-        if not lines:
+        if line_number == 0:
             rc.error(MODULE_PROMPTS, f"{jsonl_name} is empty.")
             continue
 
         all_keys_seen: set[str] = set()
-        instruction_texts: list[str] = []
-        stimulus_words: list[str] = []
-
-        # Strip blank lines once
-        non_blank = [(idx, l.strip()) for idx, l in enumerate(lines, 1) if l.strip()]
-        n_lines = len(non_blank)
-
-        # For large files, sample deterministically (first 50 + last 50)
-        MAX_JSONL_SAMPLE = 100
-        if n_lines > MAX_JSONL_SAMPLE:
-            half = MAX_JSONL_SAMPLE // 2
-            sampled = non_blank[:half] + non_blank[-half:]
-            is_sampled = True
-        else:
-            sampled = non_blank
-            is_sampled = False
+        sampled = first + list(last)
+        is_sampled = n_lines > max_sample
 
         # Counters for aggregating repeating per-line issues
         missing_field_counts: dict[str, int] = {}  # field_name -> count
@@ -585,7 +576,7 @@ def validate_prompts(
             rc.warning(
                 MODULE_PROMPTS,
                 f"{jsonl_name}: large file — validated {len(sampled)}/{n_lines} lines "
-                f"(first {MAX_JSONL_SAMPLE // 2} + last {MAX_JSONL_SAMPLE // 2}).",
+                f"(first {max_sample // 2} + last {max_sample // 2}).",
             )
         if participant_misname_count > 0:
             rc.error(
